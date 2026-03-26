@@ -1,0 +1,195 @@
+// app/api/extract-iframe/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import * as cheerio from "cheerio";
+
+const HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+};
+
+async function fetchHTML(url: string, referer?: string): Promise<string> {
+  const res = await fetch(url, {
+    headers: { ...HEADERS, ...(referer ? { Referer: referer } : {}) },
+    redirect: "follow",
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} on ${url}`);
+  return res.text();
+}
+
+function extractIframes(html: string, base: string): string[] {
+  const $ = cheerio.load(html);
+  const srcs: string[] = [];
+
+  $("iframe").each((_, el) => {
+    const src = $(el).attr("src") || $(el).attr("data-src");
+    if (src) srcs.push(new URL(src, base).toString());
+  });
+
+  // regex fallback
+  const regex = /iframe[^>]+(?:src|data-src)=["']([^"']+)["']/gi;
+  let m;
+  while ((m = regex.exec(html)) !== null) {
+    const resolved = new URL(m[1], base).toString();
+    if (!srcs.includes(resolved)) srcs.push(resolved);
+  }
+
+  return srcs;
+}
+
+export async function GET(req: NextRequest) {
+  const { searchParams } = new URL(req.url);
+  const url = searchParams.get("url");
+  const domParam = searchParams.get("dom"); // e.g. ?dom=0
+
+  if (!url) {
+    return NextResponse.json(
+      { error: "Missing `url` query parameter" },
+      { status: 400 },
+    );
+  }
+
+  try {
+    // Step 1
+    const html1 = await fetchHTML(url, new URL(url).origin);
+    const iframes1 = extractIframes(html1, url);
+
+    if (iframes1.length === 0) {
+      return NextResponse.json({ error: "No iframes found on step 1", url });
+    }
+
+    const step2Url = iframes1[0];
+    const step2Origin = new URL(step2Url).origin;
+
+    // Step 2
+    const html2 = await fetchHTML(step2Url, url);
+    const iframes2 = extractIframes(html2, step2Url);
+
+    const proRcpMatches: string[] = [];
+    const proRcpRegex = /['"](\/prorcp\/[^'"]+)['"]/g;
+    let m2;
+    while ((m2 = proRcpRegex.exec(html2)) !== null) {
+      const resolved = new URL(m2[1], step2Origin).toString();
+      if (!proRcpMatches.includes(resolved)) proRcpMatches.push(resolved);
+    }
+
+    const allStep2 = Array.from(new Set([...iframes2, ...proRcpMatches]));
+
+    if (allStep2.length === 0) {
+      return NextResponse.json({
+        step1: { url, iframes: iframes1 },
+        step2: {
+          url: step2Url,
+          iframes: [],
+          error: "No iframes or /prorcp/ paths found",
+        },
+      });
+    }
+
+    const step3Url = allStep2[0];
+
+    // Step 3
+    const html3 = await fetchHTML(step3Url, step2Url);
+
+    // Extract test_doms
+    const testDomsMatch = html3.match(/var\s+test_doms\s*=\s*(\[[\s\S]*?\]);/);
+    let domList: string[] = [];
+
+    if (testDomsMatch) {
+      try {
+        domList = JSON.parse(testDomsMatch[1]);
+      } catch {
+        const domRegex = /["'](https?:\/\/[^"']+)["']/g;
+        let dm;
+        while ((dm = domRegex.exec(testDomsMatch[1])) !== null) {
+          domList.push(dm[1]);
+        }
+      }
+    }
+
+    // Extract raw media srcs — split on " or " first to clean multi-src strings
+    const rawMediaSrcs: string[] = [];
+
+    const mediaRegex =
+      /(?:src|file|source|mediaSrc|url)\s*[:=]\s*["']([^"']*(?:\.m3u8|\.mp4|list\.m3u8|master\.m3u8)[^"']*)["']/gi;
+    let m3;
+    while ((m3 = mediaRegex.exec(html3)) !== null) {
+      // Split on " or " to separate multiple URLs packed in one string
+      const parts = m3[1].split(/\s+or\s+/);
+      for (const part of parts) {
+        const trimmed = part.trim();
+        if (trimmed && !rawMediaSrcs.includes(trimmed)) {
+          rawMediaSrcs.push(trimmed);
+        }
+      }
+    }
+
+    // Also grab from array literals
+    const arrayUrlRegex =
+      /["'](https?:\/\/[^"']*(?:\.m3u8|list\.m3u8|master\.m3u8)[^"']*)["']/g;
+    let am;
+    while ((am = arrayUrlRegex.exec(html3)) !== null) {
+      // Split on " or " here too
+      const parts = am[1].split(/\s+or\s+/);
+      for (const part of parts) {
+        const trimmed = part.trim();
+        if (trimmed && !rawMediaSrcs.includes(trimmed)) {
+          rawMediaSrcs.push(trimmed);
+        }
+      }
+    }
+
+    // If ?dom=N is provided, override all {vN} placeholders with testDoms[N]
+    const domIndex = domParam !== null ? parseInt(domParam, 10) : null;
+    const forcedDom =
+      domIndex !== null && !isNaN(domIndex)
+        ? (domList[domIndex] ?? null)
+        : null;
+
+    function resolveDomains(src: string, doms: string[]): string[] {
+      if (!src.includes("{v")) return [src];
+
+      const tokens = [...new Set(src.match(/\{v\d+\}/g) || [])];
+      let result = src;
+
+      for (const token of tokens) {
+        let domHost: string;
+
+        if (forcedDom) {
+          // Use the forced domain for ALL {vN} tokens
+          domHost = forcedDom.replace(/^https?:\/\//, "");
+          // Preserve the subdomain prefix from the token's intended domain if needed
+          // But per spec: inject testDoms[domIndex] replacing the "tmstr1.{v1}" part entirely
+          // So we replace the host portion only — keep prefix from forced dom as-is
+        } else {
+          const idx = parseInt(token.replace(/\{v|\}/g, ""), 10) - 1;
+          const dom = doms[idx];
+          if (!dom) continue;
+          domHost = dom.replace(/^https?:\/\//, "");
+        }
+
+        result = result.replaceAll(token, domHost);
+      }
+
+      if (!result.includes("{v")) return [result];
+      return [];
+    }
+
+    const resolvedSrcs = rawMediaSrcs.flatMap((src) =>
+      resolveDomains(src, domList),
+    );
+
+    return NextResponse.json({
+      links: {
+        // rawMediaSrcs,
+        // testDoms: domList,
+        // ...(forcedDom !== null && { forcedDom, domIndex }),
+        mediaSrcs: resolvedSrcs,
+      },
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return NextResponse.json({ error: msg }, { status: 500 });
+  }
+}

@@ -45,12 +45,11 @@ export async function OPTIONS() {
 
 export async function GET(request: NextRequest) {
   const { searchParams } = request.nextUrl;
-
+  // cloudflared-windows-amd64.exe tunnel run --url http://localhost:3000 my-tunnel
   const key = searchParams.get("key");
   const cfClearance =
     searchParams.get("cf_clearance") ||
-    ".bn2wT6m4V6kaFvN1ztcNlXbIVf1GkMZhVtwogkJ5l8-1774382855-1.2.1.1-V46BAI7sP8dLZOGMWbzCu9HBEtTjQY24IbdatnGPz.H7Vth.idaPxd1bYnKW00ii4W0P4.3.Bc8Fih149Dw_4dXdejCpQMgYoOzTPo.ZvGgBBG99BDD2TklCQWw1XwTcX7wQ6xN4CMdtWntHEew8M.q2F6GFZK2JQMXh8X4EdOM1ikq3UX4hrg8r5Hmf2vmaUNjOYxAmsg4FPsD6kDssl6NhBUcvjzrGMJWy1gz_o3A";
-
+    "rMzsBAYWGobQKBWRvNyxiT1ruGhV8kwwAubSLqPIzwM-1774412306-1.2.1.1-K5MsOGYXIXMHV.jL62kD4pzDMCde5XcBbCfER1nCrS7LI7l.kScLuKLx8rg4dTmgLG5LY5qeFelJLUIDQIfG.qU2H6jMfLRgeaowFX51qIG.xADckQtc.SyK9v.cgnPtFWl.cddxevW.HEfma1jmORNofIWrerN5VMVjqnShk2GdlWI0b3Mv1ISo6SKeiENwDqYvVMcdUoBQNz2p5CFT19FsEO1T3I6zYj9oC2SCq84";
   if (!key) {
     return errJson(400, "Missing required param: key");
   }

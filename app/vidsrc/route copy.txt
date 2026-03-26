@@ -1,0 +1,167 @@
+// app/api/extract-iframe/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import * as cheerio from "cheerio";
+
+const HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+};
+
+async function fetchHTML(url: string, referer?: string): Promise<string> {
+  const res = await fetch(url, {
+    headers: { ...HEADERS, ...(referer ? { Referer: referer } : {}) },
+    redirect: "follow",
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} on ${url}`);
+  return res.text();
+}
+
+function extractIframes(html: string, base: string): string[] {
+  const $ = cheerio.load(html);
+  const srcs: string[] = [];
+
+  $("iframe").each((_, el) => {
+    const src = $(el).attr("src") || $(el).attr("data-src");
+    if (src) srcs.push(new URL(src, base).toString());
+  });
+
+  // regex fallback
+  const regex = /iframe[^>]+(?:src|data-src)=["']([^"']+)["']/gi;
+  let m;
+  while ((m = regex.exec(html)) !== null) {
+    const resolved = new URL(m[1], base).toString();
+    if (!srcs.includes(resolved)) srcs.push(resolved);
+  }
+
+  return srcs;
+}
+
+export async function GET(req: NextRequest) {
+  const { searchParams } = new URL(req.url);
+  const url = searchParams.get("url");
+
+  if (!url) {
+    return NextResponse.json(
+      { error: "Missing `url` query parameter" },
+      { status: 400 },
+    );
+  }
+
+  try {
+    // Step 1: Fetch initial URL (e.g. vidsrcme.ru/embed/movie?tmdb=238)
+    const html1 = await fetchHTML(url, new URL(url).origin);
+    const iframes1 = extractIframes(html1, url);
+
+    if (iframes1.length === 0) {
+      return NextResponse.json({ error: "No iframes found on step 1", url });
+    }
+
+    const step2Url = iframes1[0]; // e.g. cloudnestra.com/rcp/...
+    const step2Origin = new URL(step2Url).origin;
+
+    // Step 2: Fetch cloudnestra.com/rcp/...
+    const html2 = await fetchHTML(step2Url, url);
+    const iframes2 = extractIframes(html2, step2Url);
+
+    // Scan JS for /prorcp/ paths (set via jQuery like in the snippet)
+    const proRcpMatches: string[] = [];
+    const proRcpRegex = /['"](\/prorcp\/[^'"]+)['"]/g;
+    let m2;
+    while ((m2 = proRcpRegex.exec(html2)) !== null) {
+      const resolved = new URL(m2[1], step2Origin).toString();
+      if (!proRcpMatches.includes(resolved)) proRcpMatches.push(resolved);
+    }
+
+    const allStep2 = Array.from(new Set([...iframes2, ...proRcpMatches]));
+
+    if (allStep2.length === 0) {
+      return NextResponse.json({
+        step1: { url, iframes: iframes1 },
+        step2: {
+          url: step2Url,
+          iframes: [],
+          error: "No iframes or /prorcp/ paths found",
+        },
+      });
+    }
+
+    const step3Url = allStep2[0]; // e.g. cloudnestra.com/prorcp/...
+
+    // Step 3: Fetch /prorcp/... page
+    const html3 = await fetchHTML(step3Url, step2Url);
+
+    // Extract test_doms from the JS
+    const testDomsMatch = html3.match(/var\s+test_doms\s*=\s*(\[[\s\S]*?\]);/);
+    let domList: string[] = [];
+
+    if (testDomsMatch) {
+      try {
+        domList = JSON.parse(testDomsMatch[1]);
+      } catch {
+        // fallback: extract quoted strings
+        const domRegex = /["'](https?:\/\/[^"']+)["']/g;
+        let dm;
+        while ((dm = domRegex.exec(testDomsMatch[1])) !== null) {
+          domList.push(dm[1]);
+        }
+      }
+    }
+
+    // Extract raw media srcs with {v1}, {v2}, etc.
+    const mediaSrcs: string[] = [];
+    const mediaRegex =
+      /(?:src|file|source|mediaSrc|url)\s*[:=]\s*["']([^"']*(?:\.m3u8|\.mp4|list\.m3u8|master\.m3u8)[^"']*)["']/gi;
+    let m3;
+    while ((m3 = mediaRegex.exec(html3)) !== null) {
+      mediaSrcs.push(m3[1]);
+    }
+
+    // Also grab from array literals like ["url1", "url2"]
+    const arrayUrlRegex =
+      /["'](https?:\/\/[^"']*(?:\.m3u8|list\.m3u8|master\.m3u8)[^"']*)["']/g;
+    let am;
+    while ((am = arrayUrlRegex.exec(html3)) !== null) {
+      if (!mediaSrcs.includes(am[1])) mediaSrcs.push(am[1]);
+    }
+
+    // Replace {v1}, {v2}, {v3}, {v4}, {v5} with actual domains
+    function resolveDomains(src: string, doms: string[]): string[] {
+      // Check if src contains any {vN} placeholder
+      if (!src.includes("{v")) return [src];
+
+      const resolved: string[] = [];
+      // Find all unique {vN} tokens in this src
+      const tokens = [...new Set(src.match(/\{v\d+\}/g) || [])];
+
+      // Replace each {vN} with its corresponding domain (strip https://)
+      let result = src;
+      for (const token of tokens) {
+        const idx = parseInt(token.replace(/\{v|\}/g, ""), 10) - 1;
+        const dom = doms[idx];
+        if (!dom) continue;
+        const domHost = dom.replace(/^https?:\/\//, "");
+        result = result.replaceAll(token, domHost);
+      }
+
+      if (!result.includes("{v")) resolved.push(result);
+      return resolved;
+    }
+
+    const resolvedSrcs = mediaSrcs.flatMap((src) =>
+      resolveDomains(src, domList),
+    );
+
+    return NextResponse.json({
+      step3: {
+        rawMediaSrcs: mediaSrcs,
+        testDoms: domList,
+        mediaSrcs: resolvedSrcs,
+      },
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return NextResponse.json({ error: msg }, { status: 500 });
+  }
+}
